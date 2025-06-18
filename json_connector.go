@@ -15,16 +15,32 @@ import (
 // 用户需要实现这个函数来替代传统的数据库查询
 type JSONReaderFunc func(ctx context.Context, sql string) (string, error)
 
+// JSONWriterFunc 定义写入数据库并返回结果的函数签名
+// 用户需要实现这个函数来处理INSERT、UPDATE、DELETE等写入操作
+type JSONWriterFunc func(ctx context.Context, sql string) (*UpdateRet, error)
+
+// UpdateRet 写入操作的返回结构
+type UpdateRet struct {
+	InsertId     int64  `json:"insert_id"`
+	AffectedRows int64  `json:"affected_rows"`
+	ServerStatus int32  `json:"server_status"`
+	WarningCount int64  `json:"warning_count"`
+	Message      string `json:"message"`
+}
+
 // JSONConnPool 实现ConnPool接口，底层使用JSON方式与数据库交互
 type JSONConnPool struct {
-	readDB JSONReaderFunc
+	readDB  JSONReaderFunc
+	writeDB JSONWriterFunc
 }
 
 // NewJSONConnPool 创建新的JSON连接池
 // readDB: 用户自定义的数据库读取函数，返回JSON字符串
-func NewJSONConnPool(readDB JSONReaderFunc) *JSONConnPool {
+// writeDB: 用户自定义的数据库写入函数，返回UpdateRet结构
+func NewJSONConnPool(readDB JSONReaderFunc, writeDB JSONWriterFunc) *JSONConnPool {
 	return &JSONConnPool{
-		readDB: readDB,
+		readDB:  readDB,
+		writeDB: writeDB,
 	}
 }
 
@@ -35,22 +51,18 @@ func (j *JSONConnPool) PrepareContext(ctx context.Context, query string) (*sql.S
 
 // ExecContext 实现ConnPool接口 - 执行非查询SQL（INSERT, UPDATE, DELETE）
 func (j *JSONConnPool) ExecContext(ctx context.Context, query string, args ...interface{}) (sql.Result, error) {
-	// 对于非查询操作，我们调用readDB但期望返回结果信息
-	jsonStr, err := j.readDB(ctx, j.interpolateSQL(query, args...))
+	// 调用用户提供的WriteDB函数
+	sql := j.interpolateSQL(query, args...)
+	result, err := j.writeDB(ctx, sql)
 	if err != nil {
 		return nil, err
 	}
 	
-	// 解析返回的JSON以获取执行结果信息
-	// 期望格式: {"rows_affected": 1, "last_insert_id": 123}
-	var result map[string]interface{}
-	if err := json.Unmarshal([]byte(jsonStr), &result); err != nil {
-		return nil, fmt.Errorf("解析执行结果JSON失败: %w", err)
-	}
-	
+	// 将UpdateRet转换为sql.Result
 	return &jsonResult{
-		rowsAffected: getInt64FromMap(result, "rows_affected"),
-		lastInsertId: getInt64FromMap(result, "last_insert_id"),
+		rowsAffected: result.AffectedRows,
+		lastInsertId: result.InsertId,
+		updateRet:    result,
 	}, nil
 }
 
@@ -362,6 +374,7 @@ func convertToBool(value interface{}) (bool, error) {
 type jsonResult struct {
 	rowsAffected int64
 	lastInsertId int64
+	updateRet    *UpdateRet // 保存完整的更新结果
 }
 
 func (r *jsonResult) LastInsertId() (int64, error) {
@@ -370,6 +383,11 @@ func (r *jsonResult) LastInsertId() (int64, error) {
 
 func (r *jsonResult) RowsAffected() (int64, error) {
 	return r.rowsAffected, nil
+}
+
+// GetUpdateResult 获取完整的更新结果（扩展方法）
+func (r *jsonResult) GetUpdateResult() *UpdateRet {
+	return r.updateRet
 }
 
 // 辅助函数
@@ -384,12 +402,18 @@ func getInt64FromMap(m map[string]interface{}, key string) int64 {
 
 // JSONDialector 自定义的Dialector，使用JSON连接池
 type JSONDialector struct {
-	readDB JSONReaderFunc
+	readDB  JSONReaderFunc
+	writeDB JSONWriterFunc
 }
 
 // NewJSONDialector 创建JSON方式的数据库方言
-func NewJSONDialector(readDB JSONReaderFunc) *JSONDialector {
-	return &JSONDialector{readDB: readDB}
+// readDB: 读取数据库的函数
+// writeDB: 写入数据库的函数
+func NewJSONDialector(readDB JSONReaderFunc, writeDB JSONWriterFunc) *JSONDialector {
+	return &JSONDialector{
+		readDB:  readDB,
+		writeDB: writeDB,
+	}
 }
 
 func (d *JSONDialector) Name() string {
@@ -398,9 +422,15 @@ func (d *JSONDialector) Name() string {
 
 func (d *JSONDialector) Initialize(db *DB) error {
 	// 替换连接池为JSON连接池
-	db.ConnPool = NewJSONConnPool(d.readDB)
+	db.ConnPool = NewJSONConnPool(d.readDB, d.writeDB)
 	// 替换查询回调为JSON查询回调
 	db.Callback().Query().Replace("gorm:query", JSONQuery)
+	// 替换创建回调为JSON创建回调
+	db.Callback().Create().Replace("gorm:create", JSONCreate)
+	// 替换更新回调为JSON更新回调
+	db.Callback().Update().Replace("gorm:update", JSONUpdate)
+	// 替换删除回调为JSON删除回调
+	db.Callback().Delete().Replace("gorm:delete", JSONDelete)
 	return nil
 }
 
